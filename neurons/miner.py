@@ -19,6 +19,7 @@ sys.path.append(BASE_DIR)
 
 from my_utils import get_sequence_from_protein_code
 from PSICHIC.wrapper import PsichicWrapper
+from DiffDock.wrapper import DiffDockWrapper
 
 class Miner:
     def __init__(self):
@@ -32,7 +33,19 @@ class Miner:
         self.current_block = 0
         self.current_challenge_protein = None
         self.last_challenge_protein = None
+        
+        # Initialize model wrappers based on command line arguments
+        self.use_diffdock = self.config.use_diffdock if hasattr(self.config, 'use_diffdock') else False
+        
+        # Log which model is being used
+        if self.use_diffdock:
+            bt.logging.info("Using DiffDock model for binding predictions")
+        else:
+            bt.logging.info("Using PSICHIC model for binding predictions")
+            
         self.psichic_wrapper = PsichicWrapper()
+        self.diffdock_wrapper = DiffDockWrapper()
+        
         self.candidate_product = None
         self.candidate_product_score = 0
         self.best_score = 0
@@ -48,6 +61,8 @@ class Miner:
         parser.add_argument('--network', default='finney', help='Network to use')
         # Adds override arguments for network and netuid.
         parser.add_argument('--netuid', type=int, default=68, help="The chain subnet uid.")
+        # Add argument to choose between PSICHIC and DiffDock
+        parser.add_argument('--use_diffdock', action='store_true', help="Use DiffDock model instead of PSICHIC")
         # Adds subtensor specific arguments.
         bt.subtensor.add_args(parser)
         # Adds logging specific arguments.
@@ -181,17 +196,17 @@ class Miner:
 
     async def run_psichic_model_loop(self):
         """
-        Continuously runs the PSICHIC model on batches of molecules from the dataset.
+        Continuously runs the binding affinity model (PSICHIC or DiffDock) on batches of molecules.
 
         This method streams random chunks of molecule data from a Hugging Face dataset,
-        processes them through the PSICHIC model to predict binding affinities, and updates
+        processes them through the selected model to predict binding affinities, and updates
         the best candidate when a higher scoring molecule is found. Runs in a separate thread
         until the shutdown event is triggered.
 
         The method:
         1. Streams data in chunks from the dataset
         2. Cleans the product names and SMILES strings
-        3. Runs PSICHIC predictions on each chunk
+        3. Runs model predictions on each chunk
         4. Updates the best candidate if a higher score is found
         5. Continues until shutdown_event is set
 
@@ -205,21 +220,36 @@ class Miner:
                     df = pd.DataFrame.from_dict(chunk)
                     df['product_name'] = df['product_name'].apply(lambda x: x.replace('"', ''))
                     df['product_smiles'] = df['product_smiles'].apply(lambda x: x.replace('"', ''))
-                    # Run the PSICHIC model on the chunk.
+                    
+                    # Run the selected model on the chunk
                     bt.logging.debug(f'Running inference...')
-                    chunk_psichic_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
-                    chunk_psichic_scores = chunk_psichic_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
-                    if chunk_psichic_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
+                    if self.use_diffdock:
+                        # Run DiffDock model
+                        chunk_scores = self.diffdock_wrapper.run_validation(df['product_smiles'].tolist())
+                    else:
+                        # Run PSICHIC model
+                        chunk_scores = self.psichic_wrapper.run_validation(df['product_smiles'].tolist())
+                    
+                    # Sort results by predicted binding affinity
+                    chunk_scores = chunk_scores.sort_values(by=self.psichic_result_column_name, ascending=False).reset_index(drop=True)
+                    
+                    # Check if we found a better candidate
+                    if chunk_scores[self.psichic_result_column_name].iloc[0] > self.best_score:
                         async with self.shared_lock:
-                            candidate_molecule = chunk_psichic_scores['Ligand'].iloc[0]
-                            self.best_score = chunk_psichic_scores[self.psichic_result_column_name].iloc[0]
+                            candidate_molecule = chunk_scores['Ligand'].iloc[0]
+                            self.best_score = chunk_scores[self.psichic_result_column_name].iloc[0]
                             self.candidate_product = df.loc[df['product_smiles'] == candidate_molecule, 'product_name'].iloc[0]
-                            bt.logging.info(f"New best score: {self.best_score}, New candidate product: {self.candidate_product}")
+                            
+                            # Log which model found the new best candidate
+                            model_name = "DiffDock" if self.use_diffdock else "PSICHIC"
+                            bt.logging.info(f"New best score from {model_name}: {self.best_score}, New candidate product: {self.candidate_product}")
+                        
                         await asyncio.sleep(1)
                     await asyncio.sleep(3)
 
             except Exception as e:
-                bt.logging.error(f"Error running PSICHIC model: {e}")
+                model_name = "DiffDock" if self.use_diffdock else "PSICHIC"
+                bt.logging.error(f"Error running {model_name} model: {e}")
                 self.shutdown_event.set()
 
     async def run(self):
@@ -251,18 +281,23 @@ class Miner:
                     # Get protein sequence from uniprot
                     protein_sequence = get_sequence_from_protein_code(self.current_challenge_protein)
 
-                    # Initialize PSICHIC for new protein
+                    # Initialize model for new protein
                     bt.logging.info(f'Initializing model for protein sequence: {protein_sequence}')
                     try:
-                        self.psichic_wrapper.run_challenge_start(protein_sequence)
-                        bt.logging.info('Model initialized successfully.')
+                        if self.use_diffdock:
+                            self.diffdock_wrapper.run_challenge_start(protein_sequence)
+                            bt.logging.info('DiffDock model initialized successfully.')
+                        else:
+                            self.psichic_wrapper.run_challenge_start(protein_sequence)
+                            bt.logging.info('PSICHIC model initialized successfully.')
                     except Exception as e:
                         bt.logging.error(f'Error initializing model: {e}')
 
                     # Start inference loop
                     try:
                         self.inference_task = asyncio.create_task(self.run_psichic_model_loop())
-                        bt.logging.debug(f'Inference task started successfully')
+                        model_name = "DiffDock" if self.use_diffdock else "PSICHIC"
+                        bt.logging.debug(f'{model_name} inference task started successfully')
                     except Exception as e:
                         bt.logging.error(f'Error initializing inference: {e}')
 

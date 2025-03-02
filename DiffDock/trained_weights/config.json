@@ -1,0 +1,28 @@
+{
+    "model_params": {
+        "node_features": 16,
+        "edge_features": 4,
+        "hidden_dim": 128,
+        "depth": 4,
+        "time_emb_dim": 32,
+        "heads": 4,
+        "dropout": 0.1
+    },
+    "diffusion_params": {
+        "num_timesteps": 1000,
+        "beta_schedule": "cosine",
+        "beta_start": 1e-4,
+        "beta_end": 0.02
+    },
+    "training_params": {
+        "batch_size": 32,
+        "learning_rate": 1e-4,
+        "weight_decay": 1e-6,
+        "epochs": 100
+    },
+    "inference_params": {
+        "sampling_steps": 20,
+        "temperature": 1.0,
+        "top_k": 5
+    }
+}
